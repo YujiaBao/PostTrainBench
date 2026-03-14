@@ -7,8 +7,9 @@
 #   uv pip install -r containers/tinker/requirements-tinker.txt
 #   uv pip install -e "$TINKER_COOKBOOK_PATH"
 
-# --- Tinker SDK ---
-tinker
+# --- Tinker SDK and tinker-cookbook ---
+# Installed from vendor/ by setup.sh (editable mode).
+# Do NOT list them here to avoid version conflicts.
 
 # --- Evaluation framework ---
 inspect-ai==0.3.150

@@ -14,10 +14,11 @@
 #   ANTHROPIC_API_KEY   - API key for the Claude agent
 #
 # Optional environment variables:
-#   TINKER_COOKBOOK_PATH         - Path to tinker-cookbook repo (default: ~/Repos/tinker-cookbook)
+#   TINKER_COOKBOOK_PATH          - Override tinker-cookbook location
+#                                  (default: containers/tinker/vendor/tinker-cookbook)
 #   POST_TRAIN_BENCH_RESULTS_DIR - Results directory (default: results)
-#   CODEX_API_KEY               - Required for contamination checking (optional but recommended)
-#   OPENAI_API_KEY              - Required for arenahardwriting/healthbench evaluation
+#   CODEX_API_KEY                - Required for contamination checking (optional but recommended)
+#   OPENAI_API_KEY               - Required for arenahardwriting/healthbench evaluation
 
 set -euo pipefail
 
@@ -79,13 +80,20 @@ if [ -d "${REPO_ROOT}/src/eval/tasks/${EVALUATION_TASK}/evaluation_code" ]; then
 fi
 
 # Symlink tinker-cookbook repo for the agent to explore
-TINKER_COOKBOOK_PATH="${TINKER_COOKBOOK_PATH:-$HOME/Repos/tinker-cookbook}"
+TINKER_COOKBOOK_PATH="${TINKER_COOKBOOK_PATH:-${REPO_ROOT}/containers/tinker/vendor/tinker-cookbook}"
 if [ -d "$TINKER_COOKBOOK_PATH" ]; then
     ln -sf "$TINKER_COOKBOOK_PATH" "${TASK_DIR}/tinker-cookbook"
 else
     echo "ERROR: tinker-cookbook not found at $TINKER_COOKBOOK_PATH"
-    echo "Set TINKER_COOKBOOK_PATH to the correct location."
+    echo "Run 'bash containers/tinker/setup.sh' first, or set TINKER_COOKBOOK_PATH."
     exit 1
+fi
+
+# Handle OPENAI_API_KEY consistently with container mode:
+# Only pass it to the agent for tasks that need it (arenahardwriting, healthbench).
+AGENT_OPENAI_API_KEY=""
+if [ "$EVALUATION_TASK" == "arenahardwriting" ] || [ "$EVALUATION_TASK" == "healthbench" ]; then
+    AGENT_OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 fi
 
 # Generate system prompt
@@ -106,28 +114,55 @@ if [ -z "${TINKER_API_KEY:-}" ]; then
     exit 1
 fi
 
-# Export environment for the agent
-export AGENT_CONFIG="$AGENT_CONFIG"
-export PROMPT="$PROMPT"
-
 # Copy agent solve script
 cp "${REPO_ROOT}/agents/${AGENT}/solve.sh" "${EVAL_DIR}/agent_solve.sh"
 
 # ---------------------------------------------------------------------------
-# Phase 2: Agent execution
+# Phase 2: Agent execution (sandboxed environment)
 # ---------------------------------------------------------------------------
+# Mirroring container mode's isolation (apptainer -c --home JOB_DIR:/home/ben):
+#   - Override HOME to a fake directory so the agent cannot access ~/.ssh,
+#     ~/.gitconfig, ~/.config/gh, or any other host credentials.
+#   - Use env -i to start with a clean environment, passing only the
+#     variables the agent needs (API keys, PATH, etc.).
+#   - The tinker-cookbook symlink is inside TASK_DIR so the agent can read
+#     it but cannot push to the repo (no git credentials in scope).
+
+AGENT_HOME="${EVAL_DIR}/agent_home"
+mkdir -p "${AGENT_HOME}"
+
+# Provide a minimal gitconfig so git doesn't error on clone/init operations
+cat > "${AGENT_HOME}/.gitconfig" <<'GITCFG'
+[user]
+    name = PostTrainBench Agent
+    email = agent@posttrainbench.local
+GITCFG
 
 echo "=== Starting agent ==="
 echo "Working directory: ${TASK_DIR}"
-
-cd "${TASK_DIR}"
+echo "Agent HOME:        ${AGENT_HOME}"
 
 SOLVE_OUT="${EVAL_DIR}/solve_out.txt"
 START_TIME=$(date +%s)
 
+# Resolve the venv python path if active, otherwise use system PATH
+AGENT_PATH="${REPO_ROOT}/containers/tinker/.venv/bin:${PATH}"
+
 set +e
 timeout --signal=TERM --kill-after=30s "$((NUM_HOURS * 60 + 5))m" \
-    bash "${EVAL_DIR}/agent_solve.sh" > "${SOLVE_OUT}" 2>&1
+    env -i \
+        HOME="${AGENT_HOME}" \
+        PATH="${AGENT_PATH}" \
+        TERM="${TERM:-xterm}" \
+        LANG="${LANG:-en_US.UTF-8}" \
+        TINKER_API_KEY="${TINKER_API_KEY}" \
+        ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}" \
+        OPENAI_API_KEY="${AGENT_OPENAI_API_KEY}" \
+        AGENT_CONFIG="${AGENT_CONFIG}" \
+        PROMPT="${PROMPT}" \
+        BASH_MAX_TIMEOUT_MS="36000000" \
+        PYTHONNOUSERSITE="1" \
+    bash -c "cd '${TASK_DIR}' && bash '${EVAL_DIR}/agent_solve.sh'" > "${SOLVE_OUT}" 2>&1
 SOLVE_EXIT=$?
 set -e
 
